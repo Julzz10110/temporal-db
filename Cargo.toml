@@ -57,6 +57,7 @@ aes-gcm = "0.10"
 
 # Compression
 zstd = "0.13"
+crc32fast = "1.4"
 
 # Distributed systems
 hashbrown = "0.14"

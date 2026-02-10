@@ -2,6 +2,7 @@
 
 use crate::core::event::Event;
 use crate::core::temporal::Timestamp;
+use crate::core::timeline::Timeline;
 use crate::error::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -45,11 +46,13 @@ pub trait EventJournal: Send + Sync {
     async fn flush(&mut self) -> Result<()>;
 }
 
-/// In-memory implementation of event journal
+/// In-memory implementation of event journal backed by per-entity timelines.
+///
+/// This keeps events ordered by timestamp and enables efficient temporal queries.
 pub struct InMemoryJournal {
-    /// Map from entity ID to timeline
-    timelines: HashMap<String, Vec<Event>>,
-    /// Map from event type to events
+    /// Map from entity ID to ordered timeline
+    timelines: HashMap<String, Timeline>,
+    /// Map from event type to events (for simple filtering by type)
     events_by_type: HashMap<String, Vec<Event>>,
 }
 
@@ -75,13 +78,14 @@ impl EventJournal for InMemoryJournal {
         let entity_id = event.entity_id().to_string();
         let event_type = event.event_type().to_string();
 
-        // Add to entity timeline
-        self.timelines
+        // Add to entity timeline (ordered by timestamp)
+        let timeline = self
+            .timelines
             .entry(entity_id)
-            .or_insert_with(Vec::new)
-            .push(event.clone());
+            .or_insert_with(|| Timeline::new(event.entity_id().to_string()));
+        timeline.append(event.clone());
 
-        // Add to type index
+        // Add to type index (kept as a flat list for now)
         self.events_by_type
             .entry(event_type)
             .or_insert_with(Vec::new)
@@ -91,6 +95,8 @@ impl EventJournal for InMemoryJournal {
     }
 
     async fn append_batch(&mut self, events: Vec<Event>) -> Result<()> {
+        // For in-memory journal we just reuse append; persistent journals
+        // can override this for true batch semantics.
         for event in events {
             self.append(event).await?;
         }
@@ -106,13 +112,10 @@ impl EventJournal for InMemoryJournal {
         let events = self
             .timelines
             .get(entity_id)
-            .map(|evts| {
-                evts
-                    .iter()
-                    .filter(|e| {
-                        let ts = e.timestamp();
-                        ts >= start && ts < end
-                    })
+            .map(|timeline| {
+                timeline
+                    .events_in_range(start, end)
+                    .into_iter()
                     .cloned()
                     .collect()
             })
@@ -122,11 +125,12 @@ impl EventJournal for InMemoryJournal {
     }
 
     async fn get_entity_events(&self, entity_id: &str) -> Result<Vec<Event>> {
-        Ok(self
+        let all = self
             .timelines
             .get(entity_id)
-            .cloned()
-            .unwrap_or_default())
+            .map(|timeline| timeline.events().cloned().collect())
+            .unwrap_or_default();
+        Ok(all)
     }
 
     async fn get_events_by_type(
@@ -161,13 +165,7 @@ impl EventJournal for InMemoryJournal {
         let event = self
             .timelines
             .get(entity_id)
-            .and_then(|evts| {
-                evts
-                    .iter()
-                    .filter(|e| e.timestamp() <= timestamp)
-                    .max_by_key(|e| e.timestamp())
-                    .cloned()
-            });
+            .and_then(|timeline| timeline.latest_before(timestamp).cloned());
 
         Ok(event)
     }

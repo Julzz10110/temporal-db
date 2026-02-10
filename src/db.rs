@@ -3,8 +3,7 @@
 use crate::core::event::{Event, EventPayload};
 use crate::core::temporal::Timestamp;
 use crate::error::{Error, Result};
-use crate::storage::{EventJournal, InMemoryJournal};
-use std::collections::HashMap;
+use crate::storage::{EventJournal, InMemoryJournal, InMemoryMaterializedView, MaterializedView};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -12,16 +11,17 @@ use tokio::sync::RwLock;
 pub struct TemporalDB {
     /// Event journal for storing events
     journal: Arc<RwLock<dyn EventJournal>>,
-    /// Current state cache (entity_id -> latest value)
-    current_state: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Current state cache / materialized view
+    view: Arc<dyn MaterializedView>,
 }
 
 impl TemporalDB {
     /// Create a new in-memory temporal database
     pub fn in_memory() -> Result<Self> {
+        let view = InMemoryMaterializedView::new();
         Ok(Self {
             journal: Arc::new(RwLock::new(InMemoryJournal::new())),
-            current_state: Arc::new(RwLock::new(HashMap::new())),
+            view: Arc::new(view),
         })
     }
 
@@ -47,11 +47,8 @@ impl TemporalDB {
         // Append to journal
         self.journal.write().await.append(event.clone()).await?;
 
-        // Update current state
-        self.current_state
-            .write()
-            .await
-            .insert(entity_id.to_string(), event.payload().data.clone());
+        // Update materialized view
+        self.view.apply_event(&event).await?;
 
         Ok(())
     }
@@ -113,13 +110,11 @@ impl TemporalDB {
         &self,
         entity_id: &str,
     ) -> Result<Option<V>> {
-        let state = self.current_state.read().await;
-        match state.get(entity_id) {
+        match self.view.get_current_raw(entity_id).await? {
             Some(data) => {
-                let payload = EventPayload::new(data.clone(), "json".to_string());
-                let value: V = payload
-                    .to_json()
-                    .map_err(|e| Error::Serialization(e.to_string()))?;
+                let payload = EventPayload::new(data, "json".to_string());
+                let value: V =
+                    payload.to_json().map_err(|e| Error::Serialization(e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
