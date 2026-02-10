@@ -1,0 +1,107 @@
+[package]
+name = "temporal-db"
+version = "0.1.0"
+edition = "2021"
+authors = ["Temporal-DB Contributors"]
+license = "Apache-2.0 OR MIT"
+description = "Event-sourced temporal database with distributed capabilities"
+repository = "https://github.com/temporal-db/temporal-db"
+keywords = ["database", "temporal", "event-sourcing", "distributed"]
+categories = ["database", "data-structures"]
+
+[lib]
+name = "temporal_db"
+path = "src/lib.rs"
+
+[[bin]]
+name = "temporal-db"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "rt-multi-thread", "macros"] }
+tokio-util = { version = "0.7", features = ["codec", "time"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+prost = "0.12"
+prost-types = "0.12"
+
+# Network & API
+tonic = "0.10"
+tonic-build = "0.10"
+hyper = "0.14"
+hyper-util = "0.1"
+http-body-util = "0.1"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Storage
+rocksdb = { version = "0.21", optional = true }
+sled = { version = "0.34", optional = true }
+dashmap = "5.5"
+bytes = "1.5"
+
+# Time & UUID
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Cryptography
+ring = "0.17"
+sha2 = "0.10"
+aes-gcm = "0.10"
+
+# Compression
+zstd = "0.13"
+
+# Distributed systems
+hashbrown = "0.14"
+ahash = "0.8"
+
+# Parsing & CLI
+nom = "7.1"
+clap = { version = "4.4", features = ["derive"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging & Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+# Metrics and observability will be added in later phases
+# metrics = { version = "0.21", optional = true }
+# metrics-prometheus = { version = "0.11", optional = true }
+# opentelemetry = { version = "0.21", optional = true }
+# opentelemetry-otlp = { version = "0.14", optional = true }
+# opentelemetry_sdk = { version = "0.21", optional = true }
+
+# Testing
+proptest = "1.3"
+quickcheck = "1.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+mockall = "0.12"
+
+[features]
+default = []
+rocksdb = ["dep:rocksdb"]
+sled = ["dep:sled"]
+full = ["rocksdb", "sled"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
