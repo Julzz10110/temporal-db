@@ -6,7 +6,6 @@
 
 use crate::core::event::Event;
 use crate::core::temporal::Timestamp;
-use crate::core::timeline::Timeline;
 use crate::error::Result;
 use crate::storage::segment_file::{
     SegmentHeader, SegmentReader, SegmentWriter, MAX_EVENTS_PER_SEGMENT, MAX_SEGMENT_SIZE,
@@ -70,8 +69,7 @@ impl SegmentManager {
             {
                 // Finalize current segment and drop the writer.
                 let writer = self.active.take().unwrap();
-                let header = writer.header().clone();
-                writer.finalize()?;
+                let header = writer.finalize()?;
                 self.segments.push(header);
             }
         }
@@ -92,8 +90,7 @@ impl SegmentManager {
     /// Flush all active data to disk and close the current segment.
     pub fn flush(&mut self) -> Result<()> {
         if let Some(writer) = self.active.take() {
-            let header = writer.header().clone();
-            writer.finalize()?;
+            let header = writer.finalize()?;
             self.segments.push(header);
         }
         Ok(())
@@ -150,6 +147,16 @@ impl<W: WriteAheadLog> SegmentedJournal<W> {
             .entry(ty)
             .or_insert_with(Vec::new)
             .push(event.clone());
+    }
+
+    /// Get list of all segment headers.
+    pub fn segments(&self) -> &[SegmentHeader] {
+        self.segment_manager.segments()
+    }
+
+    /// Read all events from all segments (used for recovery).
+    pub fn read_all_events(&self) -> Result<Vec<Event>> {
+        self.segment_manager.read_all_events()
     }
 }
 
@@ -227,6 +234,115 @@ where
         self.wal.flush()?;
         self.segment_manager.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::event::{Event, EventPayload};
+    use crate::core::temporal::Timestamp;
+    use crate::storage::wal::InMemoryWAL;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_segmented_journal_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let segments_dir = temp_dir.path().join("segments");
+        let wal = InMemoryWAL::new();
+
+        let mut journal = SegmentedJournal::new(&segments_dir, wal).unwrap();
+
+        // Append events
+        let payload1 = EventPayload::from_json(&serde_json::json!({"value": "test1"})).unwrap();
+        let event1 = Event::new(
+            "test.event".to_string(),
+            Timestamp::from_secs(1000),
+            "entity:1".to_string(),
+            payload1,
+        );
+
+        let payload2 = EventPayload::from_json(&serde_json::json!({"value": "test2"})).unwrap();
+        let event2 = Event::new(
+            "test.event".to_string(),
+            Timestamp::from_secs(1001),
+            "entity:1".to_string(),
+            payload2,
+        );
+
+        journal.append(event1.clone()).await.unwrap();
+        journal.append(event2.clone()).await.unwrap();
+        journal.flush().await.unwrap();
+
+        // Query events
+        let events = journal
+            .get_events(
+                "entity:1",
+                Timestamp::from_secs(1000),
+                Timestamp::from_secs(2000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+
+        // Verify segments were created and finalized
+        let segments = journal.segment_manager.segments();
+        assert!(!segments.is_empty(), "At least one segment should be created");
+        // After flush, segment should be finalized and compressed
+        // Note: compression happens when buffer is flushed (at 1000 events or on finalize)
+        let segment = &segments[0];
+        assert_eq!(segment.event_count, 2);
+        // Even with 2 events, finalize() should compress the buffer
+        assert_ne!(segment.flags & crate::storage::segment_file::FLAG_COMPRESSED, 0,
+            "Segment should be compressed after finalize");
+        assert_ne!(segment.checksum, 0, "Checksum should be calculated");
+    }
+
+    #[tokio::test]
+    async fn test_segmented_journal_with_compression() {
+        let temp_dir = TempDir::new().unwrap();
+        let segments_dir = temp_dir.path().join("segments");
+        let wal = InMemoryWAL::new();
+
+        let mut journal = SegmentedJournal::new(&segments_dir, wal).unwrap();
+
+        // Add many events to trigger compression
+        // Need at least 1000 events to trigger automatic flush_buffer, or rely on finalize()
+        for i in 0..100 {
+            let payload = EventPayload::from_json(&serde_json::json!({
+                "index": i,
+                "data": "repetitive data".repeat(20)
+            }))
+            .unwrap();
+            let event = Event::new(
+                "test.event".to_string(),
+                Timestamp::from_secs(1000 + i as i64),
+                format!("entity:{}", i % 10),
+                payload,
+            );
+            journal.append(event).await.unwrap();
+        }
+        journal.flush().await.unwrap();
+
+        // Verify compression
+        let segments = journal.segment_manager.segments();
+        assert!(!segments.is_empty(), "At least one segment should be created");
+        
+        // After flush(), segment should be finalized which triggers compression
+        for segment in segments {
+            // finalize() should compress even small buffers
+            assert_ne!(
+                segment.flags & crate::storage::segment_file::FLAG_COMPRESSED,
+                0,
+                "Segment should be compressed after finalize (flags={})",
+                segment.flags
+            );
+            assert_ne!(segment.checksum, 0, "Checksum should be set");
+        }
+
+        // Verify we can read all events back
+        let all_events = journal.segment_manager.read_all_events().unwrap();
+        assert_eq!(all_events.len(), 100);
     }
 }
 

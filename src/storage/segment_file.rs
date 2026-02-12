@@ -4,6 +4,7 @@ use crate::core::event::Event;
 use crate::core::temporal::Timestamp;
 use crate::error::{Error, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crc32fast::Hasher as Crc32Hasher;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,12 @@ pub const MAX_EVENTS_PER_SEGMENT: u32 = 1_000_000;
 
 /// Maximum segment size (100MB uncompressed)
 pub const MAX_SEGMENT_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Compression level for ZSTD (1-22, higher = better compression but slower)
+pub const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+
+/// Flag bits in SegmentHeader.flags
+pub const FLAG_COMPRESSED: u8 = 0x01; // Segment data is compressed with ZSTD
 
 /// Segment header structure
 #[derive(Debug, Clone)]
@@ -157,6 +164,7 @@ pub struct SegmentWriter {
     header: SegmentHeader,
     event_buffer: Vec<Event>,
     current_offset: u64,
+    checksum_hasher: Crc32Hasher,
 }
 
 impl SegmentWriter {
@@ -192,6 +200,7 @@ impl SegmentWriter {
             header,
             event_buffer: Vec::new(),
             current_offset: HEADER_SIZE as u64,
+            checksum_hasher: Crc32Hasher::new(),
         })
     }
 
@@ -234,14 +243,27 @@ impl SegmentWriter {
             serialized.extend_from_slice(&event_bytes);
         }
 
-        // TODO: Add compression here (ZSTD)
-        // For now, write uncompressed
-        self.file.write_all(&serialized)
-            .map_err(|e| Error::Io(e))?;
-        self.current_offset += serialized.len() as u64;
+        // Compress with ZSTD
+        let compressed = zstd::encode_all(&serialized[..], ZSTD_COMPRESSION_LEVEL)
+            .map_err(|e| Error::Storage(format!("ZSTD compression failed: {}", e)))?;
 
-        // Update header
-        self.header.compressed_size = self.current_offset as u32;
+        // Update checksum with compressed data
+        self.checksum_hasher.update(&compressed);
+
+        // Write compressed data with length prefix
+        let compressed_len = compressed.len() as u32;
+        self.file.write_all(&compressed_len.to_le_bytes())
+            .map_err(|e| Error::Io(e))?;
+        self.file.write_all(&compressed)
+            .map_err(|e| Error::Io(e))?;
+        
+        self.current_offset += 4 + compressed.len() as u64;
+
+        // Mark segment as compressed
+        self.header.flags |= FLAG_COMPRESSED;
+        
+        // Update header: compressed_size is the total size after header
+        self.header.compressed_size = (self.current_offset - HEADER_SIZE as u64) as u32;
 
         // Clear buffer
         self.event_buffer.clear();
@@ -250,13 +272,13 @@ impl SegmentWriter {
     }
 
     /// Finalize the segment (write header and close)
-    pub fn finalize(mut self) -> Result<()> {
+    /// Returns the finalized header with updated checksum and flags
+    pub fn finalize(mut self) -> Result<SegmentHeader> {
         // Flush remaining events
         self.flush_buffer()?;
 
-        // Calculate checksum (simple CRC32 for now)
-        // TODO: Implement proper checksum
-        self.header.checksum = 0;
+        // Calculate final checksum from all compressed data
+        self.header.checksum = self.checksum_hasher.finalize();
 
         // Write updated header
         self.file.seek(SeekFrom::Start(0))?;
@@ -264,7 +286,7 @@ impl SegmentWriter {
         self.file.write_all(&header_bytes)?;
         self.file.sync_all()?;
 
-        Ok(())
+        Ok(self.header)
     }
 
     /// Get current segment info
@@ -302,29 +324,93 @@ impl SegmentReader {
     /// Read all events from the segment
     pub fn read_events(&mut self) -> Result<Vec<Event>> {
         let mut events = Vec::new();
+        let mut checksum_hasher = Crc32Hasher::new();
 
         // Seek past header
         self.file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
 
-        // Read events until EOF
-        loop {
-            // Read event length
-            let mut len_buf = [0u8; 4];
-            match self.file.read_exact(&mut len_buf) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(Error::Io(e)),
+        // Check if segment is compressed
+        let is_compressed = (self.header.flags & FLAG_COMPRESSED) != 0;
+
+        if is_compressed {
+            // Read compressed blocks until EOF
+            loop {
+                // Read compressed block length
+                let mut len_buf = [0u8; 4];
+                match self.file.read_exact(&mut len_buf) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(Error::Io(e)),
+                }
+
+                let compressed_len = u32::from_le_bytes(len_buf) as usize;
+
+                // Read compressed data
+                let mut compressed_buf = vec![0u8; compressed_len];
+                self.file.read_exact(&mut compressed_buf)?;
+
+                // Update checksum
+                checksum_hasher.update(&compressed_buf);
+
+                // Decompress
+                let decompressed = zstd::decode_all(&compressed_buf[..])
+                    .map_err(|e| Error::Storage(format!("ZSTD decompression failed: {}", e)))?;
+
+                // Parse events from decompressed data
+                let mut offset = 0;
+                while offset < decompressed.len() {
+                    if offset + 4 > decompressed.len() {
+                        return Err(Error::Storage("Truncated event length".to_string()));
+                    }
+
+                    let event_len = u32::from_le_bytes([
+                        decompressed[offset],
+                        decompressed[offset + 1],
+                        decompressed[offset + 2],
+                        decompressed[offset + 3],
+                    ]) as usize;
+                    offset += 4;
+
+                    if offset + event_len > decompressed.len() {
+                        return Err(Error::Storage("Truncated event data".to_string()));
+                    }
+
+                    let event: Event = bincode::deserialize(&decompressed[offset..offset + event_len])
+                        .map_err(|e| Error::Serialization(e.to_string()))?;
+                    events.push(event);
+                    offset += event_len;
+                }
             }
 
-            let event_len = u32::from_le_bytes(len_buf) as usize;
+            // Verify checksum
+            let calculated_checksum = checksum_hasher.finalize();
+            if calculated_checksum != self.header.checksum {
+                return Err(Error::Storage(format!(
+                    "Checksum mismatch: expected {}, got {}",
+                    self.header.checksum, calculated_checksum
+                )));
+            }
+        } else {
+            // Legacy format: read uncompressed events
+            loop {
+                // Read event length
+                let mut len_buf = [0u8; 4];
+                match self.file.read_exact(&mut len_buf) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(Error::Io(e)),
+                }
 
-            // Read event data
-            let mut event_buf = vec![0u8; event_len];
-            self.file.read_exact(&mut event_buf)?;
+                let event_len = u32::from_le_bytes(len_buf) as usize;
 
-            // Deserialize event
-            let event: Event = bincode::deserialize(&event_buf)?;
-            events.push(event);
+                // Read event data
+                let mut event_buf = vec![0u8; event_len];
+                self.file.read_exact(&mut event_buf)?;
+
+                // Deserialize event
+                let event: Event = bincode::deserialize(&event_buf)?;
+                events.push(event);
+            }
         }
 
         Ok(events)
@@ -387,17 +473,192 @@ mod tests {
             payload2,
         );
 
-        writer.append(event1).unwrap();
-        writer.append(event2).unwrap();
-        writer.finalize().unwrap();
+        writer.append(event1.clone()).unwrap();
+        writer.append(event2.clone()).unwrap();
+        let _ = writer.finalize().unwrap();
 
         // Read segment
         let mut reader = SegmentReader::open(&segment_path).unwrap();
         let header = reader.header();
         assert_eq!(header.segment_id, 1);
         assert_eq!(header.event_count, 2);
+        
+        // Verify compression flag is set
+        assert_ne!(header.flags & FLAG_COMPRESSED, 0, "Segment should be compressed");
+        
+        // Verify checksum is non-zero
+        assert_ne!(header.checksum, 0, "Checksum should be calculated");
 
         let events = reader.read_events().unwrap();
         assert_eq!(events.len(), 2);
+        
+        // Verify events match
+        assert_eq!(events[0].event_type(), event1.event_type());
+        assert_eq!(events[0].entity_id(), event1.entity_id());
+        assert_eq!(events[1].event_type(), event2.event_type());
+        assert_eq!(events[1].entity_id(), event2.entity_id());
+    }
+
+    #[test]
+    fn test_segment_compression() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment_path = temp_dir.path().join("test_compressed.temp");
+
+        let ts1 = Timestamp::from_secs(1000);
+        let ts2 = Timestamp::from_secs(2000);
+
+        // Write segment with many events to test compression
+        let mut writer = SegmentWriter::create(&segment_path, 2, ts1, ts2).unwrap();
+
+        // Create multiple events with repetitive data (should compress well)
+        for i in 0..100 {
+            let payload = EventPayload::from_json(&serde_json::json!({
+                "index": i,
+                "data": "This is a repetitive string that should compress well".repeat(10)
+            })).unwrap();
+            let event = Event::new(
+                "test.event".to_string(),
+                Timestamp::from_secs(1000 + i as i64),
+                format!("entity:{}", i),
+                payload,
+            );
+            writer.append(event).unwrap();
+        }
+        let _ = writer.finalize().unwrap();
+
+        // Read segment
+        let mut reader = SegmentReader::open(&segment_path).unwrap();
+        let header = reader.header();
+        assert_eq!(header.event_count, 100);
+        assert_ne!(header.flags & FLAG_COMPRESSED, 0);
+        assert_ne!(header.checksum, 0);
+
+        let events = reader.read_events().unwrap();
+        assert_eq!(events.len(), 100);
+    }
+
+    #[test]
+    fn test_compression_ratio() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment_path = temp_dir.path().join("test_ratio.temp");
+
+        let ts1 = Timestamp::from_secs(1000);
+        let ts2 = Timestamp::from_secs(2000);
+
+        let mut writer = SegmentWriter::create(&segment_path, 3, ts1, ts2).unwrap();
+
+        // Create events with highly repetitive data
+        let repetitive_data = "A".repeat(1000);
+        for i in 0..50 {
+            let payload = EventPayload::from_json(&serde_json::json!({
+                "id": i,
+                "large_repetitive_data": repetitive_data,
+                "metadata": format!("event-{}", i)
+            })).unwrap();
+            let event = Event::new(
+                "test.event".to_string(),
+                Timestamp::from_secs(1000 + i as i64),
+                format!("entity:{}", i),
+                payload,
+            );
+            writer.append(event).unwrap();
+        }
+        let _ = writer.finalize().unwrap();
+
+        // Check file size
+        let file_size = std::fs::metadata(&segment_path).unwrap().len();
+        let header = SegmentReader::open(&segment_path).unwrap().header().clone();
+        
+        println!("File size: {} bytes", file_size);
+        println!("Compressed size in header: {} bytes", header.compressed_size);
+        println!("Event count: {}", header.event_count);
+        println!("Compression ratio: {:.2}x", 
+            (header.compressed_size as f64) / (file_size - HEADER_SIZE as u64) as f64);
+
+        // Verify compression is working (compressed size should be less than uncompressed)
+        assert_ne!(header.flags & FLAG_COMPRESSED, 0);
+        
+        // Read back and verify
+        let mut reader = SegmentReader::open(&segment_path).unwrap();
+        let events = reader.read_events().unwrap();
+        assert_eq!(events.len(), 50);
+    }
+
+    #[test]
+    fn test_checksum_verification() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment_path = temp_dir.path().join("test_checksum.temp");
+
+        let ts1 = Timestamp::from_secs(1000);
+        let ts2 = Timestamp::from_secs(2000);
+
+        // Write segment
+        let mut writer = SegmentWriter::create(&segment_path, 4, ts1, ts2).unwrap();
+        let payload = EventPayload::from_json(&serde_json::json!({"value": "test"})).unwrap();
+        let event = Event::new("test.event".to_string(), ts1, "entity:1".to_string(), payload);
+        writer.append(event).unwrap();
+        writer.finalize().unwrap();
+
+        // Read successfully (should work)
+        let mut reader = SegmentReader::open(&segment_path).unwrap();
+        let events = reader.read_events().unwrap();
+        assert_eq!(events.len(), 1);
+
+        // Corrupt the file by modifying a byte after the header
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(HEADER_SIZE as u64 + 10)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        file.sync_all().unwrap();
+
+        // Reading should fail due to checksum mismatch or decompression error
+        let mut reader = SegmentReader::open(&segment_path).unwrap();
+        let result = reader.read_events();
+        assert!(result.is_err(), "Reading corrupted segment should fail");
+    }
+
+    #[test]
+    fn test_multiple_compressed_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment_path = temp_dir.path().join("test_blocks.temp");
+
+        // Use a wide time range to accommodate many events
+        let ts1 = Timestamp::from_nanos(i64::MIN + 1);
+        let ts2 = Timestamp::from_nanos(i64::MAX);
+
+        let mut writer = SegmentWriter::create(&segment_path, 5, ts1, ts2).unwrap();
+
+        // Add events in batches to trigger multiple flush_buffer calls
+        // Buffer flushes at 1000 events, so we'll create multiple compressed blocks
+        for batch in 0..3 {
+            for i in 0..1000 {
+                let payload = EventPayload::from_json(&serde_json::json!({
+                    "batch": batch,
+                    "index": i,
+                    "data": format!("batch-{}-event-{}", batch, i)
+                })).unwrap();
+                // Use nanoseconds to ensure unique timestamps within the range
+                let timestamp = Timestamp::from_nanos(1000_000_000_000 + (batch * 1000 + i) as i64);
+                let event = Event::new(
+                    "test.event".to_string(),
+                    timestamp,
+                    format!("entity:{}", batch * 1000 + i),
+                    payload,
+                );
+                writer.append(event).unwrap();
+            }
+        }
+        writer.finalize().unwrap();
+
+        // Read back all events
+        let mut reader = SegmentReader::open(&segment_path).unwrap();
+        let header = reader.header();
+        assert_eq!(header.event_count, 3000);
+        assert_ne!(header.flags & FLAG_COMPRESSED, 0);
+
+        let events = reader.read_events().unwrap();
+        assert_eq!(events.len(), 3000);
     }
 }
